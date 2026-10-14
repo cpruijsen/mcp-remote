@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { auth } from '@modelcontextprotocol/client'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import { getConfigFilePath, writeJsonFile, writeTextFile } from './mcp-auth-config'
@@ -71,12 +71,18 @@ class TestNetwork {
   }
 }
 
+/** The discovery files on disk, by the flow each one belongs to. */
+async function discoveryFiles(): Promise<string[]> {
+  const prefix = `${serverUrlHash}_discovery_state_`
+  const storeDir = dirname(getConfigFilePath(serverUrlHash, 'probe'))
+  return (await readdir(storeDir)).filter((entry) => entry.startsWith(prefix)).map((entry) => entry.slice(prefix.length, -'.json'.length))
+}
+
 /**
  * The callback leg of a sign-in can land in a different process than the authorize leg, so the
  * SDK asks the provider to persist discovery state with the same durability as the code
- * verifier. Without it the callback leg discovers the authorization server all over again,
- * the freshly resolved issuer can fail the SEP-2352 check against the credential that the
- * authorize leg stored, and the first sign-in fails where a second attempt would succeed.
+ * verifier. Without it the callback leg discovers the authorization server all over again, and
+ * the code can be redeemed against a server other than the one that issued it.
  */
 describe('NodeOAuthClientProvider - persisted OAuth discovery state', () => {
   let configDir: string
@@ -106,14 +112,19 @@ describe('NodeOAuthClientProvider - persisted OAuth discovery state', () => {
     })
   }
 
-  it('saves discovery state to the config store and reads it back from another instance', async () => {
-    await provider().saveDiscoveryState(discoveryState)
+  it('saves discovery state alongside the verifier and reads it back in the instance redeeming the code', async () => {
+    const authorizing = provider()
+    await authorizing.saveDiscoveryState(discoveryState)
+    const state = authorizing.state()
+    await authorizing.saveCodeVerifier('verifier-1')
 
-    const onDisk = JSON.parse(await readFile(getConfigFilePath(serverUrlHash, 'discovery_state.json'), 'utf8'))
+    const onDisk = JSON.parse(await readFile(getConfigFilePath(serverUrlHash, `discovery_state_${state}.json`), 'utf8'))
     expect(onDisk.authorizationServerMetadata.issuer).toBe(authorizationServerUrl)
 
     // The callback leg reads it through a new instance, as a second process would
-    const readBack = await provider().discoveryState()
+    const redeeming = provider()
+    redeeming.useAuthorizationState(state)
+    const readBack = await redeeming.discoveryState()
     expect(readBack).toMatchObject({
       authorizationServerUrl,
       resourceMetadataUrl: discoveryState.resourceMetadataUrl,
@@ -128,8 +139,10 @@ describe('NodeOAuthClientProvider - persisted OAuth discovery state', () => {
   })
 
   it('treats a corrupted discovery state file as absent rather than failing the sign-in', async () => {
-    await writeJsonFile(serverUrlHash, 'discovery_state.json', { authorizationServerUrl: 42 })
-    expect(await provider().discoveryState()).toBeUndefined()
+    await writeJsonFile(serverUrlHash, 'discovery_state_corrupt-flow.json', { authorizationServerUrl: 42 })
+    const redeeming = provider()
+    redeeming.useAuthorizationState('corrupt-flow')
+    expect(await redeeming.discoveryState()).toBeUndefined()
   })
 
   it('keeps the explicit token endpoint path configured rather than persisted', async () => {
@@ -140,7 +153,8 @@ describe('NodeOAuthClientProvider - persisted OAuth discovery state', () => {
     })
 
     await explicit.saveDiscoveryState(discoveryState)
-    await expect(readFile(getConfigFilePath(serverUrlHash, 'discovery_state.json'), 'utf8')).rejects.toThrow(/ENOENT/)
+    await explicit.saveCodeVerifier('unused')
+    expect(await discoveryFiles()).toEqual([])
 
     const state = await explicit.discoveryState()
     expect(state?.authorizationServerUrl).toBe('https://identity.example.test')
@@ -151,14 +165,17 @@ describe('NodeOAuthClientProvider - persisted OAuth discovery state', () => {
     })
   })
 
-  it('deletes discovery state when the discovery or all scopes are invalidated', async () => {
-    await provider().saveDiscoveryState(discoveryState)
-    await provider().invalidateCredentials('discovery')
-    await expect(readFile(getConfigFilePath(serverUrlHash, 'discovery_state.json'), 'utf8')).rejects.toThrow(/ENOENT/)
+  it("deletes the flow's discovery state when the discovery or all scopes are invalidated", async () => {
+    for (const scope of ['discovery', 'all'] as const) {
+      const authorizing = provider()
+      await authorizing.saveDiscoveryState(discoveryState)
+      authorizing.state()
+      await authorizing.saveCodeVerifier('verifier-1')
+      expect(await discoveryFiles()).toHaveLength(1)
 
-    await provider().saveDiscoveryState(discoveryState)
-    await provider().invalidateCredentials('all')
-    await expect(readFile(getConfigFilePath(serverUrlHash, 'discovery_state.json'), 'utf8')).rejects.toThrow(/ENOENT/)
+      await authorizing.invalidateCredentials(scope)
+      expect(await discoveryFiles()).toEqual([])
+    }
   })
 
   it('round-trips the issuer stamp the SDK saves onto the stored client registration', async () => {
@@ -173,16 +190,20 @@ describe('NodeOAuthClientProvider - persisted OAuth discovery state', () => {
     expect((clientInformation as { issuer?: string } | undefined)?.issuer).toBe(authorizationServerUrl)
   })
 
-  it('persists discovery state during the authorize leg', async () => {
+  it('persists discovery state for the flow the authorize leg redirects to', async () => {
     const result = await auth(provider(), { serverUrl, fetchFn: network.fetch })
 
     expect(result).toBe('REDIRECT')
-    const onDisk = JSON.parse(await readFile(getConfigFilePath(serverUrlHash, 'discovery_state.json'), 'utf8'))
+    const [flow, ...others] = await discoveryFiles()
+    expect(others).toEqual([])
+    const onDisk = JSON.parse(await readFile(getConfigFilePath(serverUrlHash, `discovery_state_${flow}.json`), 'utf8'))
     expect(onDisk).toMatchObject({
       authorizationServerUrl,
       resourceMetadata,
     })
     expect(onDisk.authorizationServerMetadata.issuer).toBe(authorizationServerUrl)
+    // Filed under the same flow as the verifier it has to outlive the redirect with
+    await expect(readFile(getConfigFilePath(serverUrlHash, `code_verifier_${flow}.txt`), 'utf8')).resolves.toBeTruthy()
     // The registered client is stamped with the issuer that vouched for it (SEP-2352)
     const clientInfo = JSON.parse(await readFile(getConfigFilePath(serverUrlHash, 'client_info.json'), 'utf8'))
     expect(clientInfo.issuer).toBe(authorizationServerUrl)
@@ -190,7 +211,7 @@ describe('NodeOAuthClientProvider - persisted OAuth discovery state', () => {
 
   it('redeems an authorization code against the persisted discovery state without re-discovering', async () => {
     // The authorize leg, in whatever process ran it
-    await provider().saveDiscoveryState(discoveryState)
+    await writeJsonFile(serverUrlHash, 'discovery_state_issued-state.json', discoveryState)
     await writeJsonFile(serverUrlHash, 'client_info.json', {
       client_id: 'registered-client',
       redirect_uris: ['http://localhost:0/oauth/callback'],
@@ -205,11 +226,34 @@ describe('NodeOAuthClientProvider - persisted OAuth discovery state', () => {
     const result = await auth(callback, { serverUrl, authorizationCode: 'code-1', fetchFn: network.fetch })
 
     expect(result).toBe('AUTHORIZED')
-    // The whole point of the persisted state: the callback leg must not discover again,
-    // since a re-discovered issuer is what trips the SEP-2352 credential check
+    // The callback leg must not discover again: the code is redeemed against the server that issued it
     expect(network.discoveryRequests).toEqual([])
     expect(network.tokenRequests.map(({ params }) => params.get('grant_type'))).toEqual(['authorization_code'])
     expect(network.tokenRequests[0].params.get('code_verifier')).toBe('verifier-1')
     expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('saveDiscoveryState'))
+    // And the flow is over, so its discovery goes with its verifier
+    expect(await discoveryFiles()).toEqual([])
+  })
+
+  it('discovers afresh outside a sign-in, so a server that moved authorization servers is followed', async () => {
+    // Left behind by an earlier flow that pointed at an authorization server since retired
+    await writeJsonFile(serverUrlHash, 'discovery_state_earlier-flow.json', {
+      ...discoveryState,
+      authorizationServerUrl: 'https://retired-as.example.test',
+      authorizationServerMetadata: {
+        ...authorizationServerMetadata,
+        issuer: 'https://retired-as.example.test',
+        authorization_endpoint: 'https://retired-as.example.test/authorize',
+        token_endpoint: 'https://retired-as.example.test/token',
+        registration_endpoint: 'https://retired-as.example.test/register',
+      },
+    })
+
+    const result = await auth(provider(), { serverUrl, fetchFn: network.fetch })
+
+    expect(result).toBe('REDIRECT')
+    expect(network.discoveryRequests).toContain('https://mcp.example.test/.well-known/oauth-protected-resource/mcp')
+    expect(network.discoveryRequests.some((url) => url.startsWith('https://retired-as.example.test'))).toBe(false)
+    expect(network.registrationRequests).toEqual([`${authorizationServerUrl}/register`])
   })
 })
